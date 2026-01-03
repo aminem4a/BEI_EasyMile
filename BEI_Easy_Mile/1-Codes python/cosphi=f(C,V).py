@@ -40,98 +40,92 @@ cosphi = np.array([0.2037, 0.4264, 0.5562, 0.5916, 0.5723, 0.5917, 0.6014, 0.653
                    0.9486, 0.9579, 0.9207, 0.9765, 0.8835, 0.893, 0.987, 0.9494,
                    0.893, 0.94, 0.9588, 0.987, 0.9024, 0.893, 0.912, 0.912, 0.9792,
                    0.96, 0.9312, 0.96, 0.9409, 0.9409, 0.9595])
+
+
+
+
 # A. Vérification de sécurité (dimensions)
 assert len(torque) == len(speed) == len(cosphi), "Erreur : Les tableaux n'ont pas la même taille !"
 
 
+
+
+
+
+
 class TorqueAllocator:
     def __init__(self, c_data, v_data, eff_data):
-        """
-        Initialisation avec le nuage de points (Data map).
-        c_data: Array des couples
-        v_data: Array des vitesses
-        eff_data: Array des cos(phi) correspondants
-        """
-        # On crée un interpolateur pour estimer l'efficacité entre les points connus
-        # points = (C, V), values = cos(phi)
+        # Création de la cartographie d'efficacité
         self.efficiency_map = LinearNDInterpolator(list(zip(c_data, v_data)), eff_data, fill_value=0)
         
-        # Mémoire pour la contrainte de douceur (t-1)
-        self.prev_front_torque = 0.0
-        
-        # Poids pour l'optimisation (A REGLER SELON LE COMPORTEMENT VOULU)
-        self.w_smoothness = 0.5  # Pénalité pour les sauts de couple (Contrainte 3)
-        self.w_front_bias = 0.1  # Bonus pour favoriser l'avant (Contrainte 4)
+        # --- RÉGLAGE DE LA PRIORITÉ ---
+        # Ce paramètre décide à quel point on déteste utiliser les roues arrières.
+        # 0.5 : L'arrière s'active si le gain d'efficacité est visible.
+        # 2.0 : L'arrière ne s'active presque jamais (Traction pure).
+        self.penalty_rear_usage = 0.5 
 
     def get_efficiency(self, torque, speed):
-        """ Retourne cos(phi) pour un couple et une vitesse donnés """
-        # On suppose que le moteur a une efficacité symétrique ou nulle si couple < 0 (freinage non géré ici pour simplifier)
-        if torque < 0: return 0 
+        # On évite les valeurs nulles ou négatives pour la physique
+        if torque <= 0.1: return 0.01 
         return float(self.efficiency_map(torque, speed))
 
     def objective_function(self, c_front, c_total_req, speed):
         """
-        C'est la fonction que l'on veut MINIMISER.
-        Note: Maximiser l'efficacité revient à Minimiser (-efficacité).
+        On cherche à MINIMISER cette fonction.
         """
-        # Contrainte 1 & 2: Calcul du couple arrière basé sur le total
-        # c_total_req est pour les 4 roues.
-        # c_front est pour UNE roue avant.
-        # Donc: 2*c_front + 2*c_rear = c_total_req
-        # => c_rear = (c_total_req / 2) - c_front
-        
+        # 1. Calcul des couples
+        # c_front = couple sur UNE roue avant
+        # c_total_req = couple total pour les 4 roues
         c_rear = (c_total_req / 2.0) - c_front
         
-        # Si c_rear devient négatif (impossible en mode traction pure), on pénalise fortement
-        if c_rear < 0:
-            return 1e6
+        # Contrainte physique : pas de couple négatif ici
+        if c_rear < 0: return 1e9
 
-        # 1. Calcul de l'efficacité globale (Objectif principal)
+        # 2. Calcul de l'efficacité (Le but principal)
         eff_front = self.get_efficiency(c_front, speed)
         eff_rear = self.get_efficiency(c_rear, speed)
         
-        # On veut maximiser la somme des cos(phi). 
-        # On multiplie par le couple pour maximiser la Puissance Utile (optionnel, mais souvent mieux)
-        # Ici on reste sur ton critère: maximiser cos(phi) moyen
-        avg_efficiency = (eff_front + eff_rear) / 2.0
+        # On maximise la moyenne des efficacités (donc on minimise l'opposé)
+        # On multiplie par 10 pour que ce soit l'ordre de grandeur principal
+        avg_efficiency_cost = -10.0 * ((eff_front + eff_rear) / 2.0)
         
-        # 2. Contrainte 3: Douceur (Smoothness)
-        # On penalise la difference au carré avec le pas précédent
-        smoothness_penalty = self.w_smoothness * ((c_front - self.prev_front_torque) ** 2)
+        # 3. La "Taxe" sur les roues arrières (Priorité Avant)
+        # Plus on met de couple à l'arrière, plus le coût augmente.
+        # Cela force l'optimiseur à charger l'avant au maximum (c_front grand -> c_rear petit).
+        bias_cost = self.penalty_rear_usage * c_rear
         
-        # 3. Contrainte 4: Priorité Avant (Front Bias)
-        rear_penalty = self.w_front_bias * c_rear
-        total_cost = -avg_efficiency + smoothness_penalty + rear_penalty
+        # NOTE : Pas de terme "smoothness" ici, comme demandé.
         
-        return total_cost
+        return avg_efficiency_cost + bias_cost
 
     def compute_allocation(self, total_torque_cmd, speed):
-        """
-        Fonction principale appelée à chaque pas de temps (t)
-        """
-        # Bornes de recherche pour le couple avant (de 0 à la moitié du couple total)
-        # On suppose ici qu'on ne fait pas de Torque Vectoring Gauche/Droite (Contrainte 1)
-        max_torque_per_axle = total_torque_cmd / 2.0
+        # On cherche c_front entre 0 et le max possible (qui est total/2)
+        max_possible_front = total_torque_cmd / 2.0
         
-        # Optimisation
         result = minimize_scalar(
             self.objective_function,
-            bounds=(0, max_torque_per_axle),
+            bounds=(0, max_possible_front),
             args=(total_torque_cmd, speed),
             method='bounded'
         )
         
         c_front_opt = result.x
-        c_rear_opt = (total_torque_cmd / 2.0) - c_front_opt
+        c_rear_opt = max_possible_front - c_front_opt
         
-        # Mise à jour de la mémoire pour le prochain pas de temps (t+dt)
-        self.prev_front_torque = c_front_opt
-        
-        # Retourne les couples individuels (FL, FR, RL, RR)
         return {
             "T_fl": c_front_opt, "T_fr": c_front_opt,
             "T_rl": c_rear_opt,  "T_rr": c_rear_opt
         }
+
+
+
+
+
+
+
+
+
+
 
 # --- EXEMPLE D'UTILISATION ---
 
@@ -150,9 +144,9 @@ allocator = TorqueAllocator(torque, speed, cosphi)
 print(f"{'Temps':<10} | {'Consigne Totale':<15} | {'Vitesse':<10} | {'C_Avant (x2)':<15} | {'C_Arrière (x2)':<15}")
 print("-" * 75)
 
-current_speed = 50.0 # rad/s
+current_speed = 5000 # rad/s
 # On fait varier la consigne de couple total
-scenarios = [40, 42, 45, 80, 40] # Consigne totale qui change
+scenarios = [0, 200, 200, 200, 200] # Consigne totale qui change
 
 for t, global_torque_req in enumerate(scenarios):
     res = allocator.compute_allocation(global_torque_req, current_speed)
