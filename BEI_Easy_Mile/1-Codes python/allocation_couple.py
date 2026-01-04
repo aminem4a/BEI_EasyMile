@@ -131,7 +131,7 @@ class EVTorqueOptimizer:
         
         return {
             "Consigne_Globale": global_torque_cmd,
-            "Vitesse": current_speed,
+            "Vitesse": current_speed ,
             "Couple_Roue_AVANT": round(c_front_opt, 3),
             "Couple_Roue_ARRIERE": round(c_rear_opt, 3),
             "Eff_Avant": round(self.get_efficiency(c_front_opt, current_speed), 4),
@@ -142,17 +142,16 @@ class EVTorqueOptimizer:
 # 3. EXEMPLE D'UTILISATION
 # ==========================================
 
-# Initialisation (On suppose que le max moteur est 120 Nm vu tes données)
+# Initialisation 
 optimizer = EVTorqueOptimizer(torque_data, speed_data, cosphi_data, max_motor_torque=120)
 
 # Cas A : Demande faible (40 Nm total) -> On s'attend à tout sur l'avant
 print("--- TEST 1 : Faible Charge ---")
 resultat_1 = optimizer.compute_optimal_torques(global_torque_cmd=40, current_speed=2000, priority=10)
 print(resultat_1)
-# Résultat attendu : ~20 Nm Avant, ~0 Nm Arrière (car 2*20 = 40)
 
 print("\n--- TEST 2 : Forte Charge ---")
 # Cas B : Demande forte (300 Nm total) -> L'avant sature, l'arrière doit aider
 resultat_2 = optimizer.compute_optimal_torques(global_torque_cmd=300, current_speed=2000, priority=10)
 print(resultat_2)
-# Résultat attendu : Avant au max possible (ex: 120 ou proche), le reste à l'arrière
+
