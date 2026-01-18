@@ -23,6 +23,7 @@ Ce script contient :
    - Qualité : cosphi avant/arrière, score pondéré
    - Activité des contraintes : saturation / rate-limited counts
    - Exploitation de la map : nuage (|C|,V,cosphi) utilisé pendant le test + histogrammes
+
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ Z_data = np.array([0.2037, 0.4264, 0.5562, 0.5916, 0.5723, 0.5917, 0.6014, 0.653
 
 
 # =============================================================================
-# 2) Mapping (2 fits + collage) — identique à ta logique
+# 2) Mapping (2 fits + collage)
 # =============================================================================
 def build_A_full(T, S):
     T = np.asarray(T).ravel()
@@ -87,7 +88,7 @@ def fit_full(T, S, Z):
     Z_hat = A @ coeffs
     err = Z_hat - Z
     rmse = float(np.sqrt(np.mean(err**2)))
-    mae  = float(np.mean(np.abs(err)))
+    mae  = float(np.mean(np.abs(err**2)))
     denom = float(np.sum((Z - np.mean(Z))**2))
     r2 = float(1.0 - (np.sum(err**2) / denom)) if denom > 0 else float("nan")
     return coeffs, rmse, mae, r2
@@ -100,23 +101,14 @@ def predict_full(coeffs, T, S):
     A = build_A_full(T, S)
     return (A @ coeffs).reshape(T.shape)
 
-def print_fit(name, coeffs, rmse, mae, r2):
-    labels = ["a(T^2)", "b(S^2)", "c(TS)", "d(T)", "e(S)", "f(1)"]
-    print("\n" + "=" * 72)
-    print(name)
-    print("=" * 72)
-    for lab, val in zip(labels, coeffs):
-        print(f"{lab:<8s} = {val: .6e}")
-    print("-" * 72)
-    print(f"RMSE = {rmse:.6f} | MAE = {mae:.6f} | R2 = {r2:.6f}")
-    print("=" * 72)
-
 def build_mapping_two_sides(T_pos, S_pos, Z_pos, clip_01=False):
     coeff_pos, rmse_pos, mae_pos, r2_pos = fit_full(T_pos, S_pos, Z_pos)
     coeff_neg, rmse_neg, mae_neg, r2_neg = fit_full(-T_pos, S_pos, Z_pos)
 
-    print_fit("AJUSTEMENT #1 (Couples positifs)", coeff_pos, rmse_pos, mae_pos, r2_pos)
-    print_fit("AJUSTEMENT #2 (Couples negatifs - donnees miroir)", coeff_neg, rmse_neg, mae_neg, r2_neg)
+    print("\n" + "=" * 80)
+    print(f"Fit + : RMSE={rmse_pos:.6f} | MAE={mae_pos:.6f} | R2={r2_pos:.6f}")
+    print(f"Fit - : RMSE={rmse_neg:.6f} | MAE={mae_neg:.6f} | R2={r2_neg:.6f}")
+    print("=" * 80 + "\n")
 
     def f_final(T, S):
         T = np.asarray(T)
@@ -131,8 +123,36 @@ def build_mapping_two_sides(T_pos, S_pos, Z_pos, clip_01=False):
     return f_final
 
 
+def plot_map_surface(f_final, grid_n=120, clip_01=False, title="MAP cos(phi)=f(Couple,Vitesse)"):
+    Tmax = float(np.max(np.abs(T_data)))
+    t_grid = np.linspace(-Tmax, Tmax, grid_n)
+    s_grid = np.linspace(float(np.min(S_data)), float(np.max(S_data)), grid_n)
+    Tm, Sm = np.meshgrid(t_grid, s_grid)
+    Zm = f_final(Tm, Sm)
+    if clip_01:
+        Zm = np.clip(Zm, 0.0, 1.0)
+
+    fig = plt.figure(figsize=(11, 7), constrained_layout=True)
+    ax = fig.add_subplot(111, projection="3d")
+    surf = ax.plot_surface(Tm, Sm, Zm, cmap="viridis", alpha=0.62, edgecolor="none")
+
+    ax.scatter(T_data, S_data, Z_data, s=18, color="red", label="Données (T>0)")
+    ax.scatter(-T_data, S_data, Z_data, s=18, color="orange", label="Miroir (T<0)")
+
+    ax.set_xlabel("Couple (Nm)")
+    ax.set_ylabel("Vitesse (rpm)")
+    ax.set_zlabel("Cos(phi)")
+    ax.set_title(title)
+    ax.view_init(elev=22, azim=-55)
+
+    cbar = fig.colorbar(surf, ax=ax, shrink=0.62, pad=0.06)
+    cbar.set_label("Cos(phi)")
+    ax.legend(loc="upper right")
+    plt.show()
+
+
 # =============================================================================
-# 3) Optimiseur lissé : regularisation + rate limit
+# 3) Allocation smooth
 # =============================================================================
 @dataclass
 class TorqueAllocatorSmooth:
@@ -142,21 +162,18 @@ class TorqueAllocatorSmooth:
     a2: float = 0.3
     allow_regen: bool = True
 
-    # Lissage
-    lambda1: float = 5e-3   # penalise (Cav - Cav_prev)^2
-    lambda2: float = 5e-4   # penalise (Cav - 2*Cav_prev + Cav_prev2)^2
-    dC_max: float = 5.0     # max |Cav(k)-Cav(k-1)| (Nm)
+    lambda1: float = 5e-3
+    lambda2: float = 5e-4
+    dC_max: float = 5.0
 
     def __post_init__(self):
-        if self.a1 <= 0 or self.a2 <= 0:
-            raise ValueError("a1 et a2 doivent être > 0.")
         s = self.a1 + self.a2
         self.a1 /= s
         self.a2 /= s
 
     def _feasible_interval_for_Cav(self, C_total: float):
         Cmax = self.Cmax_per_wheel
-        half = 0.5 * C_total  # Car = half - Cav
+        half = 0.5 * C_total
 
         if self.allow_regen:
             lo = max(-Cmax, half - Cmax)
@@ -186,7 +203,6 @@ class TorqueAllocatorSmooth:
         lo0, hi0 = interval0
         lo, hi = lo0, hi0
 
-        # Rate limit autour de Cav_prev
         if Cav_prev is not None and self.dC_max is not None and self.dC_max > 0.0:
             lo = max(lo, Cav_prev - self.dC_max)
             hi = min(hi, Cav_prev + self.dC_max)
@@ -204,11 +220,9 @@ class TorqueAllocatorSmooth:
             eta_r = float(self.cosphi_map(Car, speed_rpm))
             score = self.a1 * eta_f + self.a2 * eta_r
 
-            # continuité
             if Cav_prev is not None and self.lambda1 > 0.0:
                 score -= self.lambda1 * (Cav - Cav_prev) ** 2
 
-            # lissage dérivée
             if Cav_prev is not None and Cav_prev2 is not None and self.lambda2 > 0.0:
                 dd = Cav - 2.0 * Cav_prev + Cav_prev2
                 score -= self.lambda2 * (dd ** 2)
@@ -237,7 +251,6 @@ def generate_test_reference(duration_s=60.0, dt=0.1, torque_peak_total=360.0):
     torque = np.empty_like(t)
 
     for i, ti in enumerate(t):
-        # speed
         if ti < 15:
             speed[i] = speed_min + (speed_max - speed_min) * (ti / 15.0)
         elif ti < 30:
@@ -249,7 +262,6 @@ def generate_test_reference(duration_s=60.0, dt=0.1, torque_peak_total=360.0):
             amp = 0.12 * (speed_max - speed_min)
             speed[i] = base + amp * np.sin(2.0 * np.pi * (ti - 45.0) / 6.0)
 
-        # torque total
         if ti < 12:
             torque[i] = torque_peak_total * (ti / 12.0)
         elif ti < 28:
@@ -263,17 +275,21 @@ def generate_test_reference(duration_s=60.0, dt=0.1, torque_peak_total=360.0):
 
 
 # =============================================================================
-# 5) MAIN : allocation smooth + analyses
+# 5) MAIN : allocation smooth + analyses + tracés de map
 # =============================================================================
 def main():
-    # --- Mapping final
+    dt = 0.1
+
+    # Mapping final
     f_final = build_mapping_two_sides(T_data, S_data, Z_data, clip_01=False)
 
-    # --- Consignes test
-    dt = 0.1
+    # Tracé map (surface + points originaux) — demandé
+    plot_map_surface(f_final, grid_n=120, clip_01=False, title="Map cos(phi)=f(Couple,Vitesse) (surface + points)")
+
+    # Scénario test
     t, speed_rpm, C_total = generate_test_reference(duration_s=60.0, dt=dt, torque_peak_total=360.0)
 
-    # --- Optimiseur smooth (valeurs de départ)
+    # Optimiseur
     Cmax_per_wheel = float(np.max(np.abs(T_data)))  # ~117 Nm
     allocator = TorqueAllocatorSmooth(
         cosphi_map=f_final,
@@ -285,9 +301,9 @@ def main():
         dC_max=5.0
     )
 
-    # --- Boucle allocation
-    Cav = np.zeros_like(t)  # couple par roue AV
-    Car = np.zeros_like(t)  # couple par roue AR
+    # Boucle allocation
+    Cav = np.zeros_like(t)
+    Car = np.zeros_like(t)
     eta_f = np.zeros_like(t)
     eta_r = np.zeros_like(t)
     score = np.zeros_like(t)
@@ -306,30 +322,22 @@ def main():
         Cav_prev2 = Cav_prev
         Cav_prev = Cav[k]
 
-    # --- Indicateurs
+    # Indicateurs
     C_rec = 2.0 * Cav + 2.0 * Car
     err_constraint = C_rec - C_total
     max_err = float(np.max(np.abs(err_constraint)))
-
     sat_count = int(np.sum(status == "SATURATED"))
     rate_count = int(np.sum(status == "RATE_LIMITED"))
 
-    # "Smoothness" : dérivée discrète (Nm/s) et seconde dérivée (Nm/s^2)
     dCav = np.gradient(Cav, dt)
     dCar = np.gradient(Car, dt)
     ddCav = np.gradient(dCav, dt)
     ddCar = np.gradient(dCar, dt)
 
-    # Partage avant (utile pour analyser la stratégie)
-    # Part avant totale = 2*Cav / C_total (attention division par 0)
     eps = 1e-9
-    front_share = (2.0 * Cav) / (np.abs(C_total) + eps)  # ratio, signe ignoré via abs au dénominateur
+    front_share = (2.0 * Cav) / (np.abs(C_total) + eps)
 
-    # Métriques cos(phi)
     eta_mean_weighted = allocator.a1 * eta_f + allocator.a2 * eta_r
-    eta_min = float(np.min(eta_mean_weighted))
-    eta_avg = float(np.mean(eta_mean_weighted))
-    eta_max = float(np.max(eta_mean_weighted))
 
     print("\n" + "=" * 96)
     print("RÉSUMÉ PERFORMANCE — Allocation smooth")
@@ -339,14 +347,10 @@ def main():
     print(f"Lissage : lambda1={allocator.lambda1:.2e}, lambda2={allocator.lambda2:.2e}, dC_max={allocator.dC_max:.3f} Nm/pas")
     print(f"Erreur max contrainte 2*Cav+2*Car=C_total : {max_err:.6e} Nm")
     print(f"SATURATED : {sat_count} / {len(t)} | RATE_LIMITED : {rate_count} / {len(t)}")
-    print(f"eta pondéré : min={eta_min:.4f} | moy={eta_avg:.4f} | max={eta_max:.4f}")
+    print(f"eta pondéré : min={float(np.min(eta_mean_weighted)):.4f} | moy={float(np.mean(eta_mean_weighted)):.4f} | max={float(np.max(eta_mean_weighted)):.4f}")
     print("=" * 96 + "\n")
 
-    # =============================================================================
-    # PLOTS (sans "raw")
-    # =============================================================================
-
-    # 1) Consignes
+    # PLOTS — consignes
     fig1, ax1 = plt.subplots(figsize=(11, 5), constrained_layout=True)
     ax1.plot(t, C_total, label="C_total demandé (Nm)")
     ax1.set_title("Consigne de couple total")
@@ -363,7 +367,7 @@ def main():
     ax2.grid(True, alpha=0.3)
     ax2.legend()
 
-    # 2) Allocation + vérif contrainte
+    # PLOTS — allocation + contrainte
     fig3, ax3 = plt.subplots(figsize=(11, 5), constrained_layout=True)
     ax3.plot(t, Cav, label="Cav (par roue)")
     ax3.plot(t, Car, label="Car (par roue)")
@@ -392,11 +396,11 @@ def main():
     ax5.grid(True, alpha=0.3)
     ax5.legend()
 
-    # 3) Smoothness (dérivées)
+    # PLOTS — smoothness
     fig6, ax6 = plt.subplots(figsize=(11, 5), constrained_layout=True)
     ax6.plot(t, dCav, label="dCav/dt (Nm/s)")
     ax6.plot(t, dCar, label="dCar/dt (Nm/s)")
-    ax6.set_title("Vitesse de variation des couples (continuité)")
+    ax6.set_title("Vitesse de variation des couples")
     ax6.set_xlabel("Temps (s)")
     ax6.set_ylabel("Nm/s")
     ax6.grid(True, alpha=0.3)
@@ -411,10 +415,10 @@ def main():
     ax7.grid(True, alpha=0.3)
     ax7.legend()
 
-    # 4) Qualité : cosphi / score
+    # PLOTS — cosphi / score / stratégie
     fig8, ax8 = plt.subplots(figsize=(11, 5), constrained_layout=True)
-    ax8.plot(t, eta_f, label="cos(phi) AV (sur Cav)")
-    ax8.plot(t, eta_r, label="cos(phi) AR (sur Car)")
+    ax8.plot(t, eta_f, label="cos(phi) AV")
+    ax8.plot(t, eta_r, label="cos(phi) AR")
     ax8.plot(t, eta_mean_weighted, label="cos(phi) pondéré")
     ax8.set_title("cos(phi) obtenu via la map")
     ax8.set_xlabel("Temps (s)")
@@ -424,29 +428,26 @@ def main():
 
     fig9, ax9 = plt.subplots(figsize=(11, 4), constrained_layout=True)
     ax9.plot(t, score, label="Score optimisé")
-    ax9.set_title("Score d'optimisation (objectif)")
+    ax9.set_title("Score d'optimisation")
     ax9.set_xlabel("Temps (s)")
     ax9.set_ylabel("[-]")
     ax9.grid(True, alpha=0.3)
     ax9.legend()
 
-    # 5) Stratégie : part avant
     fig10, ax10 = plt.subplots(figsize=(11, 4), constrained_layout=True)
     ax10.plot(t, front_share, label="Part avant = (2*Cav)/|C_total|")
-    ax10.set_title("Part de couple envoyée à l'avant (indicateur de stratégie)")
+    ax10.set_title("Part de couple envoyée à l'avant")
     ax10.set_xlabel("Temps (s)")
     ax10.set_ylabel("[-]")
     ax10.grid(True, alpha=0.3)
     ax10.legend()
 
-    # 6) Activité des contraintes (statut au cours du temps)
     fig11, ax11 = plt.subplots(figsize=(11, 3.5), constrained_layout=True)
-    # On encode les statuts en 0/1/2 pour tracer
     code = np.zeros_like(t, dtype=float)
     code[status == "OK"] = 0.0
     code[status == "RATE_LIMITED"] = 1.0
     code[status == "SATURATED"] = 2.0
-    ax11.plot(t, code, label="Status: 0=OK,1=RATE_LIMITED,2=SATURATED")
+    ax11.plot(t, code, label="Status: 0=OK, 1=RATE_LIMITED, 2=SATURATED")
     ax11.set_title("Activation des contraintes (diagnostic)")
     ax11.set_xlabel("Temps (s)")
     ax11.set_ylabel("Code")
@@ -454,33 +455,32 @@ def main():
     ax11.grid(True, alpha=0.3)
     ax11.legend()
 
-    # 7) Exploitation de la map : points (|C|, V, cosphi) utilisés + histogrammes
+    # --- Nouveau : MAP + trajectoire utilisée (points d'exploitation)
     absC_used = np.abs(np.concatenate([Cav, Car]))
     V_used = np.concatenate([speed_rpm, speed_rpm])
     eta_used = np.concatenate([eta_f, eta_r])
 
     fig12 = plt.figure(figsize=(11, 7), constrained_layout=True)
     ax12 = fig12.add_subplot(111, projection="3d")
-    ax12.scatter(absC_used, V_used, eta_used, s=10)
-    ax12.set_title("Nuage des points (|Couple|, Vitesse, cos(phi)) réellement utilisés")
+
+    # Surface map en fonction de |C| uniquement (projection utile)
+    Cgrid = np.linspace(0.0, float(np.max(np.abs(T_data))), 80)
+    Vgrid = np.linspace(float(np.min(S_data)), float(np.max(S_data)), 80)
+    Cm, Vm = np.meshgrid(Cgrid, Vgrid)
+    # On évalue f_final avec T>=0 car abs(C) ici
+    Zm = f_final(Cm, Vm)
+
+    surf2 = ax12.plot_surface(Cm, Vm, Zm, cmap="viridis", alpha=0.45, edgecolor="none")
+    ax12.scatter(absC_used, V_used, eta_used, s=10, label="Points utilisés (AV+AR)")
+
+    ax12.set_title("Map (|Couple|, Vitesse) + trajectoire réellement exploitée")
     ax12.set_xlabel("|Couple| (Nm)")
     ax12.set_ylabel("Vitesse (rpm)")
     ax12.set_zlabel("cos(phi)")
     ax12.view_init(elev=22, azim=-55)
-
-    fig13, ax13 = plt.subplots(figsize=(11, 4), constrained_layout=True)
-    ax13.hist(absC_used, bins=30)
-    ax13.set_title("Histogramme des |Couples| utilisés")
-    ax13.set_xlabel("|Couple| (Nm)")
-    ax13.set_ylabel("Occurrences")
-    ax13.grid(True, alpha=0.3)
-
-    fig14, ax14 = plt.subplots(figsize=(11, 4), constrained_layout=True)
-    ax14.hist(eta_used, bins=30)
-    ax14.set_title("Histogramme des cos(phi) obtenus")
-    ax14.set_xlabel("cos(phi)")
-    ax14.set_ylabel("Occurrences")
-    ax14.grid(True, alpha=0.3)
+    cbar2 = fig12.colorbar(surf2, ax=ax12, shrink=0.62, pad=0.06)
+    cbar2.set_label("cos(phi)")
+    ax12.legend(loc="upper right")
 
     plt.show()
 
