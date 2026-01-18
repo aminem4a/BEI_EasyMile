@@ -117,7 +117,7 @@ class EVTorqueOptimizerLS:
         2*Cav + 2*Car = Creq  =>  Car = (Creq/2) - Cav
 
     Objectif :
-        Maximiser J(Cav) = Kp*η(Cav,V) + η(Car,V)
+        Maximiser J(Cav) = a1*η(Cav,V) + a2*η(Car,V)
     """
 
     def __init__(
@@ -144,7 +144,7 @@ class EVTorqueOptimizerLS:
 
     @property
     def coeffs(self) -> np.ndarray:
-        """Copie des coefficients LS (utile pour rapport/debug)."""
+        """Copie des coefficients LS ."""
         return self._coeffs.copy()
 
     # -------------------------------------------------------------------------
@@ -213,7 +213,7 @@ class EVTorqueOptimizerLS:
         max_avant = min(self.couple_max_moteur, consigne_globale / 2.0)
         return float(min_avant), float(max_avant)
 
-    def _cout(self, couple_avant: float, consigne_globale: float, vitesse: float, priorite_avant: float) -> float:
+    def _cout(self, couple_avant: float, consigne_globale: float, vitesse: float) -> float:
         """
         Coût à minimiser : -J.
         Pénalité forte si Car sort des limites.
@@ -226,13 +226,12 @@ class EVTorqueOptimizerLS:
         eta_avant = self.cosphi(couple_avant, vitesse)
         eta_arriere = self.cosphi(couple_arriere, vitesse)
 
-        return -(priorite_avant * eta_avant + eta_arriere)
+        return -(0.7 * eta_avant + 0.3 * eta_arriere)
 
     def calculer_repartition_optimale(
         self,
         consigne_globale: float,
         vitesse: float,
-        priorite_avant: float = 10.0
     ) -> AllocationCoupleResultat:
         """
         Retourne la répartition optimale sous forme d'un résultat typé.
@@ -240,8 +239,6 @@ class EVTorqueOptimizerLS:
         """
         consigne_globale = float(consigne_globale)
         vitesse = float(vitesse)
-        priorite_avant = float(priorite_avant)
-
         self._controler_vitesse(vitesse)
 
         min_avant, max_avant = self._bornes_couple_avant(consigne_globale)
@@ -253,7 +250,7 @@ class EVTorqueOptimizerLS:
         opt_result = minimize_scalar(
             self._cout,
             bounds=(min_avant, max_avant),
-            args=(consigne_globale, vitesse, priorite_avant),
+            args=(consigne_globale, vitesse),
             method="bounded"
         )
 
@@ -263,7 +260,7 @@ class EVTorqueOptimizerLS:
         eta_avant = self.cosphi(couple_avant_opt, vitesse)
         eta_arriere = self.cosphi(couple_arriere_opt, vitesse)
 
-        score = float(priorite_avant * eta_avant + eta_arriere)
+        score = float(0.7 * eta_avant + 0.3 * eta_arriere)
 
         return AllocationCoupleResultat(
             consigne_globale=consigne_globale,
@@ -291,14 +288,14 @@ def main() -> None:
 
     print("--- TEST 1 : Faible Charge ---")
     try:
-        r1 = optimiseur.calculer_repartition_optimale(consigne_globale=40.0, vitesse=2000.0, priorite_avant=10.0)
+        r1 = optimiseur.calculer_repartition_optimale(consigne_globale=40.0, vitesse=2000.0)
         print(r1)
     except AllocationCoupleImpossible as e:
         print(f"Impossible: {e}")
 
     print("\n--- TEST 2 : Forte Charge ---")
     try:
-        r2 = optimiseur.calculer_repartition_optimale(consigne_globale=300.0, vitesse=2000.0, priorite_avant=10.0)
+        r2 = optimiseur.calculer_repartition_optimale(consigne_globale=300.0, vitesse=2000.0)
         print(r2)
     except AllocationCoupleImpossible as e:
         print(f"Impossible: {e}")
