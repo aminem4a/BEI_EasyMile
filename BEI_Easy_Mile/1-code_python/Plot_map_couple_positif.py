@@ -38,7 +38,7 @@ ax.scatter(T_data, S_data, Z_data, color='red', s=10, label='Données réelles')
 ax.set_xlabel('Couple (Nm)')
 ax.set_ylabel('Vitesse (rpm)')
 ax.set_zlabel('Cos(phi)')
-ax.set_title('Modèle Polynomial Convexe ')
+ax.set_title('Map avec C > 0 ')
 
 plt.show()
 
