@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vehicle_sim"
+version = "0.1.0"
+description = "Vehicle simulation package (open-loop first) with torque allocation and data-driven mapping"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "matplotlib",
+  "pandas",
+  "scipy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
