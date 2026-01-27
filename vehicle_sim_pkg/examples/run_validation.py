@@ -1,87 +1,148 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
-import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
+from scipy.interpolate import interp1d
+import numpy as np
 
-root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
-if root_path not in sys.path: sys.path.insert(0, root_path)
+# Ajout du chemin src
+root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
+if root not in sys.path: sys.path.insert(0, root)
 
-from vehicle_sim.simulation import Simulation
-from vehicle_sim.config import SimulationConfig, VehicleConfig
+from vehicle_sim import Simulation, SimulationConfig, VehicleConfig
+from vehicle_sim.utils import DataLoader
 
-def calculate_kpis(results, dt):
-    # 1. Efficacité (Moyenne temporelle du CosPhi moyen des 2 moteurs)
-    cp_global = (np.array(results["cosphi_av"]) + np.array(results["cosphi_ar"])) / 2.0
-    kpi_eff = np.mean(cp_global)
-
-    # 2. Rugosité (Moyenne de la dérivée absolue du couple AVANT)
-    torque_av = np.array(results["torque_fl"])
-    derivative = np.diff(torque_av) / dt
-    kpi_roughness = np.mean(np.abs(derivative))
-
-    # 3. Précision (RMSE sur tout le profil)
-    # On compare la consigne (15 km/h) à la vitesse réelle
-    v_real = np.array(results["velocity"])
-    v_target = np.array(results["target_speed"])
-    mse = ((v_real - v_target) ** 2).mean()
-    kpi_rmse = np.sqrt(mse) * 3.6 # Conversion en km/h pour que ce soit parlant
-
-    return kpi_eff, kpi_roughness, kpi_rmse
+# --- NOUVELLE FONCTION : Calcul des métriques ---
+def calculate_metrics(history, veh_cfg, dt):
+    """Calcule l'énergie totale consommée (Wh) et le CosPhi moyen."""
+    # 1. Vitesse moteur (rad/s)
+    v_ms = np.array(history["velocity"])
+    w_motor = (v_ms / veh_cfg.wheel_radius) * veh_cfg.ratio_reduction
+    
+    # 2. Couples Moteurs (Nm)
+    t_fl = np.array(history["torque_fl"])
+    t_rl = np.array(history["torque_rl"])
+    
+    # 3. Puissance Instantanée (Watts) = |Couple * Vitesse|
+    # On prend la valeur absolue (conso pure)
+    power_fl = np.abs(t_fl * w_motor)
+    power_rl = np.abs(t_rl * w_motor)
+    total_power = power_fl + power_rl
+    
+    # 4. Énergie (Wh)
+    total_energy_wh = np.sum(total_power * dt) / 3600.0
+    
+    # 5. CosPhi Moyen (Moyenne simple des valeurs non nulles)
+    cp_av = np.array(history["cosphi_av"])
+    cp_ar = np.array(history["cosphi_ar"])
+    avg_cosphi = (np.mean(cp_av) + np.mean(cp_ar)) / 2.0
+    
+    return total_energy_wh, avg_cosphi
 
 def main():
-    sim_cfg = SimulationConfig(dt=0.01, duration=15.0)
+    base_dir = os.path.dirname(os.path.dirname(__file__)) 
+    data_dir = os.path.join(base_dir, "data")
+    scenario_file = os.path.join(data_dir, "scenarios", "nominal_driving_13kmh_unloaded.csv")
+    
+    print(f"--- 🏆 Lancement VALIDATION COMPLÈTE (Graphiques + Chiffres) ---")
+    
+    # 1. Chargement
+    loader = DataLoader(data_dir)
+    t_ref, v_ref, trq_ref = loader.load_scenario(scenario_file)
+
+    if len(t_ref) == 0:
+        print("❌ Scénario vide.")
+        return
+
+    # Durée
+    duration = min(t_ref[-1], 20.0)
+    print(f"⏱️ Durée analysée : {duration}s")
+
+    # Préparation Boucle Ouverte
+    torque_profile = interp1d(t_ref, trq_ref, bounds_error=False, fill_value=0.0)
+    sim_cfg = SimulationConfig(dt=0.01, duration=duration)
     veh_cfg = VehicleConfig()
-    
-    modes = ["inverse", "piecewise", "smooth"]
-    metrics = {"Mode": [], "Efficacité": [], "Stress (Nm/s)": [], "Erreur (km/h)": []}
 
-    print("--- DÉBUT DU BENCHMARK ---")
+    modes = ["inverse", "piecewise", "smooth", "quadratic"]
+    results = {}
+    metrics = {}
 
-    for mode in modes:
-        print(f"Test du mode : {mode}...")
-        sim = Simulation(sim_cfg, veh_cfg)
-        sim.allocator.mode = mode
-        # On passe la cible en m/s
-        results = sim.run(target_speed=15.0/3.6)
+    # 2. Exécution des Simulations
+    for m in modes:
+        print(f"🚀 Simulation : {m.upper()}...")
+        sim = Simulation(sim_cfg, veh_cfg, data_dir=data_dir)
+        sim.allocator.mode = m
+        # On utilise le mode Open Loop qui fonctionne bien maintenant
+        res = sim.run_open_loop(torque_profile)
+        results[m] = res
         
-        eff, stress, rmse = calculate_kpis(results, sim_cfg.dt)
-        
-        metrics["Mode"].append(mode)
-        metrics["Efficacité"].append(eff)
-        metrics["Stress (Nm/s)"].append(stress)
-        metrics["Erreur (km/h)"].append(rmse)
+        # Calcul immédiat des scores
+        e_wh, cp_avg = calculate_metrics(res, veh_cfg, sim_cfg.dt)
+        metrics[m] = {"E": e_wh, "CP": cp_avg}
 
-    df = pd.DataFrame(metrics)
-    print("\n--- RÉSULTATS DU COMPARATIF ---")
-    print(df.to_string(index=False))
+    # ==========================================
+    # PARTIE 1 : TABLEAU DES RÉSULTATS (NOUVEAU)
+    # ==========================================
+    print("\n" + "="*65)
+    print(f"{'STRATÉGIE':<15} | {'ÉNERGIE (Wh)':<15} | {'COSPHI MOYEN':<15} | {'GAIN %':<10}")
+    print("-" * 65)
     
-    # --- VISUALISATION (3 Graphiques) ---
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
+    ref_energy = metrics["inverse"]["E"] # Référence = Inverse
     
-    colors = ['gray', 'orange', 'green']
-    
-    # Graphe 1 : Efficacité
-    ax1.bar(df["Mode"], df["Efficacité"], color=colors, alpha=0.7)
-    ax1.set_title("Efficacité Moyenne (CosPhi)\n(Plus haut = Mieux)")
-    ax1.set_ylim(0, 1.0)
-    for i, v in enumerate(df["Efficacité"]):
-        ax1.text(i, v + 0.01, f"{v:.2f}", ha='center', fontweight='bold')
+    for m in modes:
+        e = metrics[m]["E"]
+        cp = metrics[m]["CP"]
+        # Calcul du gain (Combien on a économisé par rapport à Inverse)
+        if ref_energy > 0:
+            gain = ((ref_energy - e) / ref_energy) * 100.0
+        else:
+            gain = 0.0
+            
+        print(f"{m.upper():<15} | {e:.4f} Wh        | {cp:.3f}           | {gain:+.2f}%")
+    print("="*65 + "\n")
 
-    # Graphe 2 : Stress
-    ax2.bar(df["Mode"], df["Stress (Nm/s)"], color=colors, alpha=0.7)
-    ax2.set_title("Stress Mécanique Actionneurs\n(Plus bas = Mieux)")
-    ax2.set_ylabel("Nm/s")
-    for i, v in enumerate(df["Stress (Nm/s)"]):
-        ax2.text(i, v + 1, f"{v:.0f}", ha='center', fontweight='bold')
+    # ==========================================
+    # PARTIE 2 : GRAPHIQUES (ANCIEN CODE CONSERVÉ)
+    # ==========================================
+    print("📊 Génération des graphiques...")
+    plt.figure("Validation Complète", figsize=(10, 10))
+    
+    # Graphe 1 : Vitesse (Vérif modèle)
+    plt.subplot(3, 1, 1)
+    plt.plot(t_ref, v_ref * 3.6, 'k--', label="Réalité", linewidth=2, alpha=0.5)
+    for m in modes:
+        v_kmh = [x * 3.6 for x in results[m]["velocity"]]
+        plt.plot(results[m]["time"], v_kmh, label=m)
+    plt.title("Suivi de Vitesse (Boucle Ouverte)")
+    plt.ylabel("km/h")
+    plt.legend()
+    plt.grid(True)
+    plt.xlim(0, duration)
 
-    # Graphe 3 : RMSE (Nouveau)
-    ax3.bar(df["Mode"], df["Erreur (km/h)"], color=colors, alpha=0.7)
-    ax3.set_title("Erreur de Suivi Vitesse (RMSE)\n(Plus bas = Mieux)")
-    ax3.set_ylabel("Erreur Moyenne (km/h)")
-    for i, v in enumerate(df["Erreur (km/h)"]):
-        ax3.text(i, v + 0.01, f"{v:.3f}", ha='center', fontweight='bold')
+    # Graphe 2 : Couple (Vérif Entrée)
+    plt.subplot(3, 1, 2)
+    plt.plot(t_ref, trq_ref, 'k--', label="Consigne Totale (CSV)", alpha=0.3)
+    for m in modes:
+        # On affiche le couple AVANT pour voir la répartition
+        plt.plot(results[m]["time"], results[m]["torque_fl"], label=f"Couple AV ({m})")
+    plt.title("Répartition du Couple (Zoom sur l'Avant)")
+    plt.ylabel("Nm")
+    plt.legend()
+    plt.grid(True)
+    plt.xlim(0, duration)
+
+    # Graphe 3 : CosPhi (Vérif Efficacité)
+    plt.subplot(3, 1, 3)
+    for m in modes:
+        # Moyenne AV+AR pour lisibilité
+        cp_moy = [(a+b)/2 for a,b in zip(results[m]["cosphi_av"], results[m]["cosphi_ar"])]
+        plt.plot(results[m]["time"], cp_moy, label=m)
+    plt.title("CosPhi Moyen Instantané")
+    plt.xlabel("Temps (s)")
+    plt.ylabel("Cos Phi")
+    plt.ylim(0, 1.1)
+    plt.grid(True)
+    plt.xlim(0, duration)
 
     plt.tight_layout()
     plt.show()
