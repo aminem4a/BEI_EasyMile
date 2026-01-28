@@ -1,120 +1,159 @@
-# -*- coding: utf-8 -*-
 import numpy as np
-from typing import List
-from scipy.optimize import minimize_scalar
-import cvxpy as cp 
-from ..utils import DataLoader 
 
 class TorqueAllocator:
-    def __init__(self, mode: str = "smooth", data_loader: DataLoader = None):
-        self.mode = mode
-        self.loader = data_loader
+    def __init__(self, loader):
+        # Le loader sert uniquement de backup ou pour info, 
+        # car maintenant tout le monde utilise les polynômes.
+        self.loader = loader
         
-        # Paramètres
-        self.lambda_smooth = 0.005 
-        self.max_rate = 300.0
-        self.last_tf = 0.0
-        self.prev_torques = np.zeros(4)
+        # --- 1. TES COEFFICIENTS (MODÈLE DE PERTES) ---
+        # Formule : Loss = A*T^2 + B*w^2 + G*T*w + D*T + E*w + F
         
-        self.T_nom = 180.0       # Limite par moteur
-        self.T_GLOBAL_MAX = 500.0 # Limite GLOBALE (Sécurité Projet)
+        # Cas Couple POSITIF (T >= 0)
+        self.COEFFS_POS = {
+            'A': -0.000125338082179,
+            'B': -7.33783997958e-08,
+            'D': 0.0272621224832,
+            'E': 0.000657907533808,
+            'F': -0.634473528053,
+            'G': -5.31545729369e-06
+        }
+        
+        # Cas Couple NEGATIF (T < 0)
+        # Attention : le fit a été fait sur -T_data, donc on adapte les signes
+        self.COEFFS_NEG = {
+            'A': -0.000125338082179,
+            'B': -7.33783997958e-08,
+            'D': -0.0272621224832,  # Signe inversé car terme en T
+            'E': 0.000657907533808,
+            'F': -0.634473528053,
+            'G': 5.31545729369e-06  # Signe inversé car terme en T*w
+        }
 
-    def _estimate_cosphi(self, T, omega_rad):
-        if self.loader:
-            rpm = abs(omega_rad) * 9.5493
-            if np.isnan(T) or np.isnan(rpm): return 0.5
-            return self.loader.get_cosphi(T, rpm)
-        return 0.5
-
-    def allocate(self, total_cmd: float, rpm: float, dt: float) -> List[float]:
-        # --- SÉCURITÉ : CLAMPING GLOBAL 500 Nm ---
-        # On force la commande à rester dans [-500, +500] quoi qu'il arrive
-        total_cmd = np.clip(total_cmd, -self.T_GLOBAL_MAX, self.T_GLOBAL_MAX)
-        
-        omega = rpm * 0.1047
-        
-        # --- 1. INVERSE ---
-        if self.mode == "inverse":
-            split = total_cmd / 4.0
-            return [split] * 4
-
-        # --- 2. PIECEWISE / SMOOTH ---
-        if self.mode in ["piecewise", "smooth"]:
-            low = min(0, total_cmd)
-            high = max(0, total_cmd)
+    def get_poly_loss(self, T, rpm):
+        """
+        Calcule les pertes selon le modèle polynomial.
+        Utilisé par TOUTES les stratégies.
+        """
+        # Sélection des coeffs selon le signe du couple
+        if T >= 0:
+            c = self.COEFFS_POS
+        else:
+            c = self.COEFFS_NEG
             
-            # Inversion des bornes si freinage
-            if total_cmd < 0:
-                low, high = high, low 
+        w = abs(rpm) # Vitesse toujours positive dans le modèle (ou symétrique)
+        
+        # Application de la formule complète
+        # L = A*T^2 + B*w^2 + G*T*w + D*T + E*w + F
+        loss = (c['A'] * T**2 + 
+                c['B'] * w**2 + 
+                c['G'] * T * w + 
+                c['D'] * T + 
+                c['E'] * w + 
+                c['F'])
+        
+        # On évite les pertes négatives (aberration du modèle à très faible charge)
+        # On met un plancher à 0 ou une petite valeur de frottement
+        if loss < 0:
+            loss = 0.0
+            
+        return loss
 
-            # Lissage temporel
-            if self.mode == "smooth":
-                d_max = self.max_rate * dt * 2.0
-                low = max(low, self.last_tf - d_max)
-                high = min(high, self.last_tf + d_max)
-                if low > high: low, high = high, low
+    def optimize(self, strategy_name, T_req, rpm, prev_front_ratio=0.5):
+        if abs(rpm) < 1.0: rpm = 1.0
+        strat = strategy_name.lower() if strategy_name else "inverse"
+        
+        if "inverse" in strat:
+            return self._strat_inverse(T_req, rpm)
+        elif "piecewise" in strat:
+            # Grid Search utilisant le polynôme
+            return self._strat_search(T_req, rpm, use_smooth=False)
+        elif "smooth" in strat:
+            # Grid Search lissé utilisant le polynôme
+            return self._strat_search(T_req, rpm, use_smooth=True, prev_ratio=prev_front_ratio)
+        elif "quadratic" in strat:
+            # Résolution analytique exacte des coefficients
+            return self._strat_polynomial_analytical(T_req, rpm)
+        else:
+            return self._strat_inverse(T_req, rpm)
 
-            # Optimisation
-            if abs(total_cmd) < 1e-3:
-                self.last_tf = 0.0
-                return [0.0] * 4
+    def _strat_inverse(self, T_req, rpm):
+        # 50/50
+        return self._build(T_req * 0.5, T_req * 0.5, rpm)
 
-            def cost_func(t_front_axle):
-                t_rear_axle = total_cmd - t_front_axle
-                eff_f = self._estimate_cosphi(t_front_axle/2.0, omega)
-                eff_r = self._estimate_cosphi(t_rear_axle/2.0, omega)
-                J = -(eff_f + eff_r)
+    def _strat_search(self, T_req, rpm, use_smooth=False, prev_ratio=0.5):
+        """
+        Cherche le meilleur ratio en testant plein de combinaisons
+        et en calculant le coût via get_poly_loss.
+        """
+        ratios = np.linspace(0, 1, 41) # Plus précis (pas de 2.5%)
+        best_cost = float('inf')
+        best_r = 0.5
+        
+        alpha = 200.0 if use_smooth else 0.0
+        
+        for r in ratios:
+            Tf = T_req * r
+            Tr = T_req * (1 - r)
+            
+            # ICI : On utilise bien le polynôme pour évaluer la performance
+            loss = self.get_poly_loss(Tf, rpm) + self.get_poly_loss(Tr, rpm)
+            
+            cost = loss + alpha * (r - prev_ratio)**2
+            
+            if cost < best_cost:
+                best_cost = cost
+                best_r = r
                 
-                if self.mode == "smooth":
-                    J += self.lambda_smooth * (t_front_axle - self.last_tf)**2
-                return J
+        return self._build(T_req * best_r, T_req * (1 - best_r), rpm)
 
-            try:
-                res = minimize_scalar(cost_func, bounds=(low, high), method='bounded')
-                if res.success:
-                    tf_axle = res.x
-                    self.last_tf = tf_axle
-                    tr_axle = total_cmd - tf_axle
-                    return [tf_axle/2, tf_axle/2, tr_axle/2, tr_axle/2]
-            except:
-                pass
-
-        # --- 3. QUADRATIC ---
-        if self.mode == "quadratic":
-            return self._solve_qp_robust(total_cmd, omega)
-
-        # Fallback
-        return [total_cmd/4.0] * 4
-
-    def _solve_qp_robust(self, T_global, omega) -> List[float]:
-        try:
-            effs = []
-            for t_prev in self.prev_torques:
-                e = max(0.01, self._estimate_cosphi(t_prev, omega))
-                effs.append(e)
-
-            x = cp.Variable(4)
-            # Minimisation des pertes Joules pondérées
-            Q_weights = [1.0/e for e in effs]
-            obj = cp.Minimize(cp.sum([Q_weights[i] * x[i]**2 for i in range(4)]))
+    def _strat_polynomial_analytical(self, T_req, rpm):
+        """
+        Résolution directe.
+        Minimiser a*Tf^2 + b*Tf + ...
+        """
+        if T_req >= 0:
+            coeffs = self.COEFFS_POS
+        else:
+            coeffs = self.COEFFS_NEG
             
-            constraints = [
-                cp.sum(x) == T_global,
-                x >= -self.T_nom,
-                x <= self.T_nom
-            ]
+        a = coeffs['A']
+        # Le terme linéaire total dépend aussi de G*w et D
+        # Loss(T) = A*T^2 + (D + G*w)*T + (Cstes en w)
+        # On minimise Loss(Tf) + Loss(Tr) avec Tr = T_req - Tf
+        
+        # Si a < 0 (Concave, ce qui est ton cas avec -0.000125)
+        # Le minimum est sur les bords (0 ou T_req)
+        if a < 0:
+            # On compare les deux extrêmes pour être sûr
+            loss_tout_avant = self.get_poly_loss(T_req, rpm) + self.get_poly_loss(0, rpm)
+            loss_tout_arriere = self.get_poly_loss(0, rpm) + self.get_poly_loss(T_req, rpm)
             
-            prob = cp.Problem(obj, constraints)
-            prob.solve(solver=cp.OSQP, verbose=False)
+            if loss_tout_avant < loss_tout_arriere:
+                Tf = T_req
+            else:
+                Tf = 0.0
+                
+            # Si T_req est très petit, on reste au milieu pour la stabilité
+            if abs(T_req) < 1.0:
+                Tf = T_req * 0.5
+                
+        else:
+            # Cas Convexe (Classique) : Répartition équilibrée 50/50 car moteurs identiques
+            Tf = T_req * 0.5
 
-            if prob.status in ["optimal", "optimal_inaccurate"]:
-                res = x.value
-                self.prev_torques = res
-                return list(res)
-        except:
-            pass
-        return [T_global/4.0]*4
+        Tr = T_req - Tf
+        return self._build(Tf, Tr, rpm)
 
-    def _get_phys_limits(self, rpm):
-        if self.loader: return self.loader.get_max_torque(rpm)
-        return self.T_nom
+    def _build(self, Tf, Tr, rpm):
+        """
+        Construit la réponse finale.
+        IMPORTANT : On renvoie ici la perte polynomiale pour l'affichage graphique.
+        """
+        lf = self.get_poly_loss(Tf, rpm)
+        lr = self.get_poly_loss(Tr, rpm)
+        return {
+            'T_front': Tf,
+            'T_rear': Tr,
+            'P_loss': lf + lr
+        }

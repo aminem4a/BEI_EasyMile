@@ -1,110 +1,113 @@
-# -*- coding: utf-8 -*-
 import sys
 import os
-import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
 import numpy as np
+import matplotlib.pyplot as plt
 
-# Ajout du chemin src
-root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
-if root not in sys.path: sys.path.insert(0, root)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from vehicle_sim import Simulation, SimulationConfig, VehicleConfig
-from vehicle_sim.utils import DataLoader
+from src.vehicle_sim.control.allocation import TorqueAllocator
+from src.vehicle_sim.utils.data_loader import DataLoader
 
 def main():
-    # 1. Configuration des chemins
-    base_dir = os.path.dirname(os.path.dirname(__file__)) 
+    # 1. Setup des chemins
+    base_dir = os.path.dirname(os.path.dirname(__file__))
     data_dir = os.path.join(base_dir, "data")
-    scenario_file = os.path.join(data_dir, "scenarios", "nominal_driving_13kmh_unloaded.csv")
     
-    print(f"--- 📂 Lancement Scénario ---")
+    # FICHIER SCÉNARIO À CHOISIR ICI
+    # Assure-toi que ce fichier existe dans data/ ou data/scenarios/
+    scenario_filename = "nominal_driving_5kmh_unloaded.csv"
     
-    # 2. Chargement du Scénario
-    loader = DataLoader(data_dir)
-    t_ref, v_ref = loader.load_scenario(scenario_file)
+    scenario_path = os.path.join(data_dir, scenario_filename)
+    if not os.path.exists(scenario_path):
+        # Essai dans le sous-dossier scenarios si pas trouvé
+        scenario_path = os.path.join(data_dir, "scenarios", scenario_filename)
 
-    if len(t_ref) == 0:
-        print("❌ Arrêt : Scénario vide ou illisible.")
-        return
+    map_path = os.path.join(data_dir, "efficiency_map_clean.csv")
 
-    # --- LIMITATION DURÉE (Pour test rapide) ---
-    # Remplacez 20.0 par t_ref[-1] pour simuler tout le fichier
-    duration = min(t_ref[-1], 20.0) 
-    print(f"⏱️ Durée simulation limitée à : {duration} secondes")
+    loader = DataLoader(map_path)
+    allocator = TorqueAllocator(loader)
 
-    # 3. Préparation Simulation
-    target_profile = interp1d(t_ref, v_ref, bounds_error=False, fill_value=v_ref[-1])
-    sim_cfg = SimulationConfig(dt=0.01, duration=duration)
-    veh_cfg = VehicleConfig()
+    print(f"Lecture du scénario : {scenario_path}")
 
-    modes = ["inverse", "piecewise", "smooth", "quadratic"]
-    results = {}
+    # --- CORRECTION DU BUG D'UNPACKING ICI ---
+    # On récupère 3 valeurs (Temps, Vitesse, Couple)
+    # Le _ sert à ignorer la 3ème valeur si on recalcule le couple nous-mêmes,
+    # ou alors on l'utilise directement (trq_ref).
+    try:
+        t_ref, v_ref, trq_ref_csv = loader.load_scenario(scenario_path)
+    except ValueError:
+        # Si jamais le loader n'en renvoie que 2 (ancienne version)
+        t_ref, v_ref = loader.load_scenario(scenario_path)
+        trq_ref_csv = np.zeros_like(t_ref) # Fallback
 
-    # 4. Exécution des Stratégies
-    for m in modes:
-        print(f"🚀 Simulation : {m.upper()}...")
-        sim = Simulation(sim_cfg, veh_cfg, data_dir=data_dir)
-        sim.allocator.mode = m
-        results[m] = sim.run(target_speed_profile=target_profile)
+    # Pour l'exemple, on peut ignorer le couple du CSV et simuler une demande constante
+    # OU utiliser celui du fichier. Ici, je prends une demande constante pour tester.
+    trq_req = 100.0 # Demande de 100 Nm constante (modifiable)
 
-    # ==========================================
-    #               AFFICHAGE
-    # ==========================================
-    print("📊 Génération des graphiques...")
+    strategies = ["Inverse", "Piecewise", "Smooth", "Quadratic"]
+    results = {s: {'power': [], 'cos_phi': []} for s in strategies}
 
-    # --- FIGURE 1 : DYNAMIQUE (Vitesse & Couple) ---
-    plt.figure("Dynamique Véhicule", figsize=(10, 8))
+    print("Simulation en cours...")
     
-    # Sous-graphique 1 : Vitesse
+    # 2. Boucle Temporelle
+    for i, t in enumerate(t_ref):
+        rpm = (v_ref[i] * 60) / (2 * np.pi * 0.3) # Rayon roue approx 0.3m
+        if rpm < 10: rpm = 10 # Évite div par 0
+        
+        # Si tu veux utiliser le couple du CSV, décommente la ligne ci-dessous :
+        # trq_req = trq_ref_csv[i]
+
+        for strat in strategies:
+            # Pour Smooth, on a besoin du ratio précédent
+            prev_ratio = 0.5 
+            if i > 0 and len(results[strat]['power']) > 0:
+                # (Simplification: on ne stocke pas le ratio dans results ici, on suppose 0.5)
+                pass 
+
+            res = allocator.optimize(strat, trq_req, rpm, prev_front_ratio=prev_ratio)
+            
+            # Stockage simple
+            # Puissance élec = Puissance Méca + Pertes
+            p_meca = (trq_req * v_ref[i] / 0.3) 
+            p_elec = p_meca + res['P_loss']
+            
+            # Calcul CosPhi fictif (si P_elec > 0)
+            cos_phi = p_meca / p_elec if p_elec > 1 else 0
+
+            results[strat]['power'].append(p_elec)
+            results[strat]['cos_phi'].append(cos_phi)
+
+    # 3. Affichage
+    plt.figure(figsize=(12, 8))
+    
+    styles_map = {
+        'Inverse':   ('-',  4.0, 0.4),
+        'Piecewise': ('--', 2.5, 0.8),
+        'Smooth':    ('-.', 2.0, 1.0),
+        'Quadratic': (':',  2.0, 1.0)
+    }
+
     plt.subplot(2, 1, 1)
-    plt.plot(t_ref, v_ref * 3.6, 'k--', label="Référence (Mesure)", linewidth=2, alpha=0.6)
-    for m in modes:
-        v_kmh = [x * 3.6 for x in results[m]["velocity"]]
-        plt.plot(results[m]["time"], v_kmh, label=f"Simu {m}")
-    plt.title("Suivi de Vitesse")
-    plt.ylabel("Vitesse (km/h)")
+    for name, data in results.items():
+        ls, lw, alpha = styles_map.get(name, ('-', 1.5, 1.0))
+        plt.plot(t_ref, data['power'], label=name, 
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.ylabel("Puissance Elec (W)")
+    plt.title(f"Simulation sur {scenario_filename}")
     plt.legend()
     plt.grid(True)
-    plt.xlim(0, duration)
 
-    # Sous-graphique 2 : Couple Total (Avant + Arrière) ou juste Avant
     plt.subplot(2, 1, 2)
-    for m in modes:
-        # On affiche le couple moteur Avant pour comparer l'activité
-        plt.plot(results[m]["time"], results[m]["torque_fl"], label=f"Couple AV ({m})")
-    plt.title("Sollicitation Moteur Avant")
+    for name, data in results.items():
+        ls, lw, alpha = styles_map.get(name, ('-', 1.5, 1.0))
+        plt.plot(t_ref, data['cos_phi'], label=name,
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.ylabel("Efficacité (Est.)")
     plt.xlabel("Temps (s)")
-    plt.ylabel("Couple (Nm)")
+    plt.legend()
     plt.grid(True)
-    plt.xlim(0, duration)
-
-    # --- FIGURE 2 : EFFICACITÉ (Cos Phi Avant vs Arrière) ---
-    plt.figure("Analyse Efficacité (CosPhi)", figsize=(10, 8))
-
-    # Sous-graphique 1 : Cos Phi AVANT
-    plt.subplot(2, 1, 1)
-    for m in modes:
-        plt.plot(results[m]["time"], results[m]["cosphi_av"], label=m)
-    plt.title("Efficacité Moteur AVANT (Cos φ)")
-    plt.ylabel("Cos φ")
-    plt.ylim(0, 1.05)
-    plt.legend(loc='lower right')
-    plt.grid(True)
-    plt.xlim(0, duration)
-
-    # Sous-graphique 2 : Cos Phi ARRIÈRE
-    plt.subplot(2, 1, 2)
-    for m in modes:
-        plt.plot(results[m]["time"], results[m]["cosphi_ar"], label=m, linestyle='--')
-    plt.title("Efficacité Moteur ARRIÈRE (Cos φ)")
-    plt.xlabel("Temps (s)")
-    plt.ylabel("Cos φ")
-    plt.ylim(0, 1.05)
-    plt.grid(True)
-    plt.xlim(0, duration)
-
-    # Affichage final des deux fenêtres
+    
+    plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":

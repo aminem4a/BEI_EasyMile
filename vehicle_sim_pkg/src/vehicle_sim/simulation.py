@@ -1,120 +1,115 @@
-# -*- coding: utf-8 -*-
-from .models import Vehicle
-from .control import SpeedController, TorqueAllocator
-from .config import SimulationConfig, VehicleConfig
-from .utils import DataLoader
+import os
+import sys
+import numpy as np
+
+# Path Hack
+current_dir = os.path.dirname(os.path.abspath(__file__))
+pkg_dir = os.path.dirname(os.path.dirname(current_dir))
+if pkg_dir not in sys.path: sys.path.append(pkg_dir)
+
+try:
+    from src.data_loader import DataLoader
+    from src.vehicle_sim.control.allocation import TorqueAllocator
+except ImportError:
+    from src.vehicle_sim.utils.data_loader import DataLoader
+    from src.vehicle_sim.control.allocation import TorqueAllocator
 
 class Simulation:
-    def __init__(self, sim_cfg: SimulationConfig, veh_cfg: VehicleConfig, data_dir: str = None):
+    def __init__(self, sim_cfg, veh_cfg, data_dir=None):
         self.sim_cfg = sim_cfg
+        self.veh_cfg = veh_cfg
         
-        # Chargement des données (Map + Limites)
-        self.loader = None
-        if data_dir:
-            self.loader = DataLoader(data_dir)
-            if self.loader.torque_max_interp:
-                veh_cfg.max_motor_torque = self.loader.get_max_torque(0)
+        if data_dir is None: data_dir = os.path.join(pkg_dir, "data")
+        
+        map_path = os.path.join(data_dir, "efficiency_map_clean.csv")
+        if not os.path.exists(map_path): map_path = os.path.join(data_dir, "efficiency_map.csv")
 
-        self.vehicle = Vehicle(veh_cfg, dt=sim_cfg.dt)
-        
-        # Le PID est créé mais ne servira que pour run() (Boucle Fermée)
-        self.controller = SpeedController(kp=12000.0, ki=4000.0)
-        
-        # L'allocateur sert pour les deux modes
-        self.allocator = TorqueAllocator(mode="smooth", data_loader=self.loader)
-        
-        self.history = {
-            "time": [], "velocity": [], 
-            "torque_fl": [], "torque_rl": [], 
-            "cosphi_av": [], "cosphi_ar": []
-        }
+        self.loader = DataLoader(map_path)
+        self.allocator = TorqueAllocator(self.loader)
+        self.strategies = ["Inverse", "Piecewise", "Smooth", "Quadratic"]
 
-    def run(self, target_speed_profile=None):
-        """
-        MODE 1 : BOUCLE FERMÉE (Closed Loop)
-        Le PID adapte le couple pour suivre la vitesse cible.
-        Utilisé par : run_real_scenario.py
-        """
-        self._reset_history()
-        t = 0.0
-        steps = int(self.sim_cfg.duration / self.sim_cfg.dt)
-        print_interval = max(1, steps // 10)
+    def _val(self, obj, key, default):
+        if isinstance(obj, dict): return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def run_open_loop(self, t, trq_profile, v_profile=None):
+        wheel_r = self._val(self.veh_cfg, 'wheel_radius', 0.3)
         
-        for i in range(steps):
-            if i % print_interval == 0:
-                print(f"   [BF] Calcul : {(i/steps)*100:.0f}%")
+        if v_profile is None:
+            rpm_target = self._val(self.sim_cfg, 'rpm', 500.0)
+            v_const = (rpm_target * 2 * np.pi * wheel_r) / 60
+            v_profile = np.full_like(t, v_const)
 
-            # 1. Consigne de Vitesse
-            if hasattr(target_speed_profile, '__call__'):
-                tgt = float(target_speed_profile(t))
-            else:
-                tgt = float(target_speed_profile or 0.0)
+        global_res = {}
+        print(f"▶️ Simulation Open Loop ({len(t)} points)...")
 
-            # 2. Vitesse actuelle
-            v = self.vehicle.velocity
-            v_rpm = (v / self.vehicle.config.wheel_radius) * self.vehicle.config.ratio_reduction * 9.55
+        for strat in self.strategies:
+            r_ratio = []
+            r_power = []
             
-            # 3. PID : Calcul du Couple nécessaire pour atteindre la vitesse
-            t_roues = self.controller.compute_command(tgt, v, self.sim_cfg.dt)
-            t_moteurs_total = t_roues / self.vehicle.config.ratio_reduction
+            # Nouvelles données demandées
+            r_cos_phi_f = []
+            r_cos_phi_r = []
+            r_trq_achieved = [] # Suivi de consigne
             
-            # 4. Allocation & Physique
-            self._step_physics(t_moteurs_total, v_rpm, t, v)
-            t += self.sim_cfg.dt
+            prev_ratio = 0.5
             
-        return self.history
+            for i in range(len(t)):
+                T_req = trq_profile[i]
+                v = v_profile[i]
+                rpm = (v * 60) / (2 * np.pi * wheel_r)
+                
+                # Optimisation
+                res = self.allocator.optimize(strat, T_req, rpm, prev_front_ratio=prev_ratio)
+                
+                Tf = res['T_front']
+                Tr = res['T_rear']
+                
+                # Mise à jour Ratio
+                if abs(T_req) < 0.1:
+                    ratio = prev_ratio 
+                else:
+                    ratio = Tf / T_req
+                    prev_ratio = ratio
+                
+                # --- CALCULS AVANCÉS ---
+                # 1. Pertes recalculées via la MAP (Vérité terrain)
+                loss_f = self.loader.get_loss(Tf, rpm)
+                loss_r = self.loader.get_loss(Tr, rpm)
+                
+                # 2. Puissances Méca
+                w = rpm * 2 * np.pi / 60
+                Pm_f = Tf * w
+                Pm_r = Tr * w
+                
+                # 3. Puissances Elec
+                Pe_f = Pm_f + loss_f
+                Pe_r = Pm_r + loss_r
+                
+                # 4. Cos Phi (Efficacité ~ Pm / Pe)
+                # On évite la div par 0 et on borne entre 0 et 1
+                def calc_cos(pm, pe):
+                    if abs(pe) < 1.0: return 0.0
+                    val = pm / pe
+                    return min(max(val, 0.0), 1.0) # Clamp 0-1
 
-    def run_open_loop(self, torque_profile_func):
-        """
-        MODE 2 : BOUCLE OUVERTE (Open Loop)
-        On injecte directement un profil de couple (ex: issu d'un fichier).
-        La vitesse résulte de la physique (F=ma).
-        Utilisé par : run_open_loop.py
-        """
-        self._reset_history()
-        t = 0.0
-        steps = int(self.sim_cfg.duration / self.sim_cfg.dt)
-        print_interval = max(1, steps // 10)
-        
-        for i in range(steps):
-            if i % print_interval == 0:
-                print(f"   [BO] Calcul : {(i/steps)*100:.0f}%")
-
-            # 1. Vitesse actuelle (pour info et calcul CosPhi)
-            v = self.vehicle.velocity
-            v_rpm = (v / self.vehicle.config.wheel_radius) * self.vehicle.config.ratio_reduction * 9.55
+                cos_f = calc_cos(Pm_f, Pe_f)
+                cos_r = calc_cos(Pm_r, Pe_r)
+                
+                # Stockage
+                r_ratio.append(ratio)
+                r_power.append(Pe_f + Pe_r)
+                r_cos_phi_f.append(cos_f)
+                r_cos_phi_r.append(cos_r)
+                r_trq_achieved.append(Tf + Tr) # Couple réel total
+                
+            global_res[strat] = {
+                'time': t, 
+                'front_ratio': r_ratio, 
+                'power': r_power,
+                'cos_phi_f': r_cos_phi_f,
+                'cos_phi_r': r_cos_phi_r,
+                'trq_achieved': r_trq_achieved
+            }
             
-            # 2. Lecture Directe du Couple (Pas de PID)
-            t_roues_total = float(torque_profile_func(t))
-            t_moteurs_total = t_roues_total / self.vehicle.config.ratio_reduction
-            
-            # 3. Allocation & Physique
-            self._step_physics(t_moteurs_total, v_rpm, t, v)
-            t += self.sim_cfg.dt
-            
-        return self.history
-
-    def _step_physics(self, t_moteurs_total, v_rpm, t, v):
-        """Méthode interne partagée pour éviter de copier-coller le code"""
-        # Allocation
-        cmds = self.allocator.allocate(t_moteurs_total, v_rpm, self.sim_cfg.dt)
-        
-        # Application Physique
-        self.vehicle.update_dynamics(cmds, self.sim_cfg.dt)
-        
-        # Enregistrement
-        self.history["time"].append(t)
-        self.history["velocity"].append(v)
-        self.history["torque_fl"].append(cmds[0])
-        self.history["torque_rl"].append(cmds[2])
-        
-        rads = v_rpm * 0.1047
-        self.history["cosphi_av"].append(self.allocator._estimate_cosphi(cmds[0], rads))
-        self.history["cosphi_ar"].append(self.allocator._estimate_cosphi(cmds[2], rads))
-
-    def _reset_history(self):
-        self.history = {
-            "time": [], "velocity": [], 
-            "torque_fl": [], "torque_rl": [], 
-            "cosphi_av": [], "cosphi_ar": []
-        }
+        return global_res

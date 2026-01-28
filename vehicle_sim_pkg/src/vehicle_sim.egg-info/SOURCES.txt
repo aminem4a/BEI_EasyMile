@@ -8,7 +8,7 @@ src/vehicle_sim.egg-info/dependency_links.txt
 src/vehicle_sim.egg-info/requires.txt
 src/vehicle_sim.egg-info/top_level.txt
 src/vehicle_sim/control/__init__.py
-src/vehicle_sim/control/allocations.py
+src/vehicle_sim/control/allocation.py
 src/vehicle_sim/control/controllers.py
 src/vehicle_sim/models/__init__.py
 src/vehicle_sim/models/engine.py

@@ -1,127 +1,138 @@
-# -*- coding: utf-8 -*-
-import os
 import pandas as pd
 import numpy as np
-from scipy.interpolate import interp1d
+from scipy.interpolate import LinearNDInterpolator, interp1d
 
 class DataLoader:
-    """
-    Chargeur avec Coefficients Polynomiaux FORCÉS (Hard-coded).
-    Modèle : Z = A*T^2 + B*S^2 + G*T*S + D*T + E*S + F
-    """
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        
-        # --- 1. COEFFICIENTS FORCÉS (Donnés par l'utilisateur) ---
-        # Ordre : [T^2 (A), S^2 (B), T*S (G), T (D), S (E), 1 (F)]
-        
-        # Cas C >= 0
-        self.coeffs_pos = np.array([
-            -0.000125338082179,   # A (T^2)
-            -7.33783997958e-08,   # B (S^2)
-            -5.31545729369e-06,   # G (T*S) --> Interaction
-             0.0272621224832,     # D (T)
-             0.000657907533808,   # E (S)
-            -0.634473528053       # F (Constante)
-        ])
-        
-        # Cas C < 0
-        self.coeffs_neg = np.array([
-            -0.000125338082179,   # A' (T^2)
-            -7.33783997958e-08,   # B' (S^2)
-             5.31545729369e-06,   # G' (T*S) --> Signe opposé
-            -0.0272621224832,     # D' (T)   --> Signe opposé
-             0.000657907533808,   # E' (S)
-            -0.634473528053       # F' (Constante)
-        ])
-
-        # Pas de normalisation (Vos coeffs sont pour des valeurs brutes)
-        self.scale_rpm = 1.0
-        self.scale_torque = 1.0
-        self.torque_max_interp = None
-        
-        # Chargement (uniquement pour les limites physiques, pas pour le modèle)
-        self.load_torque_characteristics(os.path.join(data_dir, "engine_carac.csv"))
-        
-        # On charge quand même le CSV juste pour info ou limites, mais on ignore ses données pour le modèle
-        path = os.path.join(data_dir, "efficiency_map_clean.csv")
-        if not os.path.exists(path): path = os.path.join(data_dir, "efficiency_map.csv")
-        self.load_efficiency_map(path)
-
-    def _clean_column(self, series):
-        s = series.astype(str).str.replace(';', '').str.replace(',', '.').str.strip()
-        return pd.to_numeric(s, errors='coerce')
-
-    def load_efficiency_map(self, filepath: str):
-        # Cette fonction ne sert plus qu'à afficher que tout va bien
-        # Les coefficients sont déjà chargés dans le __init__
-        print(f"🔍 [Loader] Utilisation des coefficients MANUELS (A, B, D, E, F, G).")
-        print(f"   -> Modèle Positif et Négatif chargés.")
-
-    def get_cosphi(self, torque, rpm):
+    def __init__(self, map_path):
         """
-        Calcul du CosPhi avec le modèle polynomial manuel.
+        Charge la map d'efficacité/pertes et prépare les interpolateurs.
         """
-        t = float(torque)
-        s = abs(float(rpm))
-        
-        # Sélection des coefficients
-        if t >= 0:
-            coeffs = self.coeffs_pos
-            # Pour le cas positif, on utilise t directement
-            # Vecteur : [t^2, s^2, t*s, t, s, 1]
-            x = np.array([t**2, s**2, t*s, t, s, 1.0])
-        else:
-            coeffs = self.coeffs_neg
-            # Pour le cas négatif, t est négatif (ex: -10)
-            # Votre modèle pour C < 0 semble attendre le C brut (puisque D' est négatif)
-            # Vérifions : D'*C = (-0.027) * (-10) = +0.27 (Positif, correct)
-            # Vérifions : G'*C*S = (+5.3e-6) * (-10) * S = -... (Correct par rapport à G)
-            x = np.array([t**2, s**2, t*s, t, s, 1.0])
+        self.map_path = map_path
+        self.interpolator = None      # Pour l'efficacité (2D)
+        self.torque_max_interp = None # Pour le couple max (1D) -> C'est ce qui manquait !
+        self._load_map()
 
-        # Produit scalaire
-        val = np.dot(x, coeffs)
-        
-        # Bornes physiques (CosPhi entre 0.1 et 1.0)
-        # On garde 0.1 en plancher, mais avec vos coeffs, ça devrait être bien mieux centré
-        return float(max(0.1, min(0.99, val)))
-
-    def load_torque_characteristics(self, filepath: str):
-        if not os.path.exists(filepath): return
+    def _load_map(self):
         try:
-            df = pd.read_csv(filepath, sep=None, engine='python')
-            df.columns = [c.lower().strip() for c in df.columns]
-            c_spd = next((c for c in df.columns if 'speed' in c), None)
-            c_trq = next((c for c in df.columns if 'torque' in c), None)
-            if c_spd and c_trq:
-                df[c_spd] = self._clean_column(df[c_spd])
-                df[c_trq] = self._clean_column(df[c_trq])
-                df.dropna(inplace=True)
-                df.sort_values(by=c_spd, inplace=True)
-                self.torque_max_interp = interp1d(df[c_spd], df[c_trq], kind='linear', fill_value="extrapolate")
-        except: pass
+            df = pd.read_csv(self.map_path)
+            
+            # Nettoyage des noms de colonnes
+            df.columns = [c.strip().lower() for c in df.columns]
+            
+            # Identification des colonnes
+            col_speed = next((c for c in df.columns if 'speed' in c or 'rpm' in c or 'vitesse' in c), None)
+            col_torque = next((c for c in df.columns if 'torque' in c or 'nm' in c or 'couple' in c), None)
+            col_eff = next((c for c in df.columns if 'eff' in c or 'rendement' in c), None)
 
-    def get_max_torque(self, rpm):
-        if self.torque_max_interp is None: return 180.0
-        return float(self.torque_max_interp(abs(rpm)))
+            if not (col_speed and col_torque and col_eff):
+                print(f"⚠️ Colonnes non reconnues. Tentative avec indices 0, 1, 2.")
+                # Fallback indices
+                cols = df.columns
+                col_speed, col_torque, col_eff = cols[0], cols[1], cols[2]
+
+            # 1. Création de l'interpolateur d'efficacité (2D)
+            # On prend la valeur absolue pour la vitesse et le couple (symétrie supposée)
+            points = df[[col_speed, col_torque]].copy()
+            points[col_speed] = points[col_speed].abs()
+            points[col_torque] = points[col_torque].abs()
+            values = df[col_eff].values
+
+            # On utilise LinearNDInterpolator pour gérer les nuages de points non réguliers
+            self.interpolator = LinearNDInterpolator(points.values, values, fill_value=0.5)
+
+            # 2. Création de l'interpolateur de Couple Max (1D)
+            # C'est ce qui manquait à simulation.py !
+            # On cherche pour chaque vitesse, quel est le couple maximal renseigné dans la map
+            
+            # On arrondit la vitesse pour grouper les points similaires (évite les doublons flottants)
+            df['speed_round'] = df[col_speed].abs().round(1)
+            
+            # On groupe par vitesse et on prend le couple max absolu
+            envelope = df.groupby('speed_round')[col_torque].apply(lambda x: x.abs().max()).reset_index()
+            envelope = envelope.sort_values('speed_round')
+
+            # On crée une fonction d'interpolation 1D (Vitesse -> Couple Max)
+            # bounds_error=False et fill_value permettent d'extrapoler ou de garder la dernière valeur
+            self.torque_max_interp = interp1d(
+                envelope['speed_round'], 
+                envelope[col_torque], 
+                kind='linear', 
+                bounds_error=False, 
+                fill_value=(envelope[col_torque].iloc[0], envelope[col_torque].iloc[-1])
+            )
+            
+            print(f"✅ Map chargée : {len(df)} points. Enveloppe de couple max générée.")
+
+        except Exception as e:
+            print(f"❌ Erreur critique chargement map : {e}")
+            # Fallbacks pour éviter le crash
+            self.interpolator = lambda x: np.array([0.8])
+            self.torque_max_interp = lambda x: 200.0 # Couple max par défaut
+
+    def get_loss(self, torque, rpm):
+        """
+        Calcule les pertes (en Watts).
+        """
+        speed_abs = abs(rpm)
+        torque_abs = abs(torque)
+        
+        # Récupérer l'efficacité
+        try:
+            eff = float(self.interpolator([speed_abs, torque_abs])[0])
+        except:
+            eff = 0.8 # Valeur par défaut si hors map
+
+        # Sécurités
+        if eff < 0.05: eff = 0.05
+        if eff > 1.0: eff = 1.0 
+
+        # Calcul Puissance Méca
+        w_rad = speed_abs * 2 * np.pi / 60
+        p_meca = torque_abs * w_rad
+
+        if p_meca < 1e-3:
+            return 10.0 + 0.01 * speed_abs 
+
+        # Pertes = P_elec - P_meca = (P_meca/eff) - P_meca
+        losses = p_meca * (1.0/eff - 1.0)
+        return losses
     
-    def load_scenario(self, filepath: str):
-        if not os.path.exists(filepath): return [], [], []
-        try:
-            df = pd.read_csv(filepath, sep=None, engine='python')
-            df.columns = [c.lower().strip() for c in df.columns]
-            c_time = next((c for c in df.columns if 'time' in c), None)
-            c_speed = next((c for c in df.columns if 'speed' in c), None)
-            c_trq = next((c for c in df.columns if 'torque' in c), None)
-            if not c_trq: c_trq = next((c for c in df.columns if 'feedback' in c), None)
+    def get_max_torque(self, rpm):
+        """Retourne le couple max disponible pour un RPM donné."""
+        if self.torque_max_interp:
+            return float(self.torque_max_interp(abs(rpm)))
+        return 200.0
 
-            if c_time and c_speed and c_trq:
-                t = self._clean_column(df[c_time])
-                v = self._clean_column(df[c_speed])
-                trq = self._clean_column(df[c_trq])
-                mask = ~np.isnan(t) & ~np.isnan(v) & ~np.isnan(trq)
-                t, v, trq = t[mask].values, v[mask].values, trq[mask].values
-                if len(t) > 0 and t[-1] > 1000: t /= 1000.0
-                return t, v, trq
-        except: pass
-        return [], [], []
+    def load_scenario(self, filepath):
+        """
+        Charge un scénario CSV et renvoie (t, v, trq).
+        """
+        try:
+            # On utilise le moteur python pour éviter les erreurs de parsing C parfois
+            df = pd.read_csv(filepath, sep=None, engine='python')
+            
+            df.columns = [c.strip().lower() for c in df.columns]
+
+            # Recherche des colonnes
+            col_t = next((c for c in df.columns if 'time' in c or 'temps' in c or 'sec' in c), df.columns[0])
+            col_v = next((c for c in df.columns if 'speed' in c or 'vit' in c or 'vel' in c), None)
+            col_trq = next((c for c in df.columns if 'torq' in c or 'cpl' in c or 'couple' in c), None)
+
+            t = df[col_t].values
+            
+            if col_v:
+                v = df[col_v].values
+            else:
+                # Si pas de vitesse, on suppose que c'est la dernière colonne ou 0
+                v = np.zeros_like(t)
+
+            if col_trq:
+                trq = df[col_trq].values
+            else:
+                trq = np.zeros_like(t)
+
+            return t, v, trq
+
+        except Exception as e:
+            print(f"Erreur load_scenario {filepath}: {e}")
+            return np.array([0]), np.array([0]), np.array([0])

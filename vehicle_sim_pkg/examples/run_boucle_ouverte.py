@@ -1,102 +1,93 @@
-# -*- coding: utf-8 -*-
 import sys
 import os
-import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
 import numpy as np
+import matplotlib.pyplot as plt
 
-# Ajout du chemin src
-root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
-if root not in sys.path: sys.path.insert(0, root)
-
-from vehicle_sim import Simulation, SimulationConfig, VehicleConfig
-from vehicle_sim.utils import DataLoader
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.vehicle_sim.simulation import Simulation
 
 def main():
-    base_dir = os.path.dirname(os.path.dirname(__file__)) 
-    data_dir = os.path.join(base_dir, "data")
-    scenario_file = os.path.join(data_dir, "scenarios", "nominal_driving_13kmh_unloaded.csv")
+    veh_cfg = {'wheel_radius': 0.3}
+    sim_cfg = {'rpm': 500.0}
+
+    # SCENARIO
+    t = np.linspace(0, 10, 200)
+    # Sinus + une petite composante constante pour ne pas rester autour de 0 tout le temps
+    trq_profile = 100 + 100 * np.sin(2 * np.pi * 0.2 * t) 
+    v_profile = np.full_like(t, 50.0 / 3.6) 
+
+    sim = Simulation(sim_cfg, veh_cfg)
+    results = sim.run_open_loop(t, trq_profile, v_profile)
+
+    # AFFICHAGE COMPLET
+    plt.figure(figsize=(15, 12)) # Plus grand pour tout afficher
     
-    print(f"--- 📂 Lancement Simulation BOUCLE OUVERTE ---")
-    
-    # 1. Chargement (Temps, Vitesse, Couple)
-    loader = DataLoader(data_dir)
-    t_ref, v_ref, trq_ref = loader.load_scenario(scenario_file)
+    styles = {
+        'Inverse': ('-', 3, 0.4),
+        'Piecewise': ('--', 2, 0.8),
+        'Smooth': ('-.', 2, 1.0),
+        'Quadratic': (':', 2.5, 1.0) # On met en avant le quadratic
+    }
 
-    if len(t_ref) == 0:
-        print("❌ Arrêt : Scénario vide.")
-        return
-
-    # Durée
-    duration = min(t_ref[-1], 20.0) # On limite à 20s pour tester
-    print(f"⏱️ Durée : {duration}s")
-
-    # 2. Création de la fonction d'interpolation du COUPLE
-    # C'est ce qu'on va "rejouer" dans la simulation
-    torque_profile = interp1d(t_ref, trq_ref, bounds_error=False, fill_value=0.0)
-
-    sim_cfg = SimulationConfig(dt=0.01, duration=duration)
-    veh_cfg = VehicleConfig()
-
-    modes = ["inverse", "piecewise", "smooth", "quadratic"]
-    results = {}
-
-    for m in modes:
-        print(f"🚀 Simulation Open Loop : {m.upper()}...")
-        sim = Simulation(sim_cfg, veh_cfg, data_dir=data_dir)
-        sim.allocator.mode = m
-        
-        # APPEL DE LA NOUVELLE MÉTHODE OPEN LOOP
-        results[m] = sim.run_open_loop(torque_profile)
-
-    # 3. Affichage
-    print("📊 Génération des graphiques...")
-    
-    # Figure 1 : Vérification Physique (Vitesse + Couple injecté)
-    plt.figure("Open Loop - Dynamique", figsize=(10, 8))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(t_ref, v_ref * 3.6, 'k--', label="Vitesse Réelle (Target)", linewidth=2, alpha=0.5)
-    for m in modes:
-        v_sim = [x * 3.6 for x in results[m]["velocity"]]
-        plt.plot(results[m]["time"], v_sim, label=f"Simu {m}")
-    plt.title("Vitesse : Réalité vs Simulation (Dérive attendue)")
-    plt.ylabel("km/h")
-    plt.legend()
+    # 1. SUIVI DE CONSIGNE (Total Torque)
+    plt.subplot(3, 2, 1)
+    # Trace la consigne en noir
+    plt.plot(t, trq_profile, 'k', linewidth=1, label="Consigne")
+    for name, data in results.items():
+        ls, lw, alpha = styles.get(name, ('-', 1, 1))
+        # On trace le 'trq_achieved'
+        plt.plot(data['time'], data['trq_achieved'], label=name, 
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.title("Suivi de Consigne (Couple Total)")
+    plt.ylabel("Couple (Nm)")
     plt.grid(True)
-    plt.xlim(0, duration)
-
-    plt.subplot(2, 1, 2)
-    plt.plot(t_ref, trq_ref, 'r-', label="Couple Total injecté (CSV)", alpha=0.3)
-    # On superpose le couple total généré par l'allocateur pour vérifier
-    t_sim = results["smooth"]["time"]
-    trq_sim_tot = [(results["smooth"]["torque_fl"][i] + results["smooth"]["torque_rl"][i])*veh_cfg.ratio_reduction for i in range(len(t_sim))]
-    plt.plot(t_sim, trq_sim_tot, 'b--', label="Couple Total Simu (Vérif)")
-    plt.title("Entrée : Couple à la roue")
-    plt.ylabel("Nm")
     plt.legend()
-    plt.grid(True)
-    plt.xlim(0, duration)
 
-    # Figure 2 : Efficacité (CosPhi)
-    plt.figure("Open Loop - Efficacité", figsize=(10, 8))
-    plt.subplot(2, 1, 1)
-    for m in modes:
-        plt.plot(results[m]["time"], results[m]["cosphi_av"], label=m)
-    plt.title("Cos Phi Avant")
-    plt.ylim(0, 1.1)
-    plt.legend()
+    # 2. RATIO
+    plt.subplot(3, 2, 2)
+    for name, data in results.items():
+        ls, lw, alpha = styles.get(name, ('-', 1, 1))
+        plt.plot(data['time'], data['front_ratio'], label=name, 
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.title("Répartition (Ratio Avant)")
+    plt.ylabel("0=Arr, 1=Av")
     plt.grid(True)
-    plt.xlim(0, duration)
-    
-    plt.subplot(2, 1, 2)
-    for m in modes:
-        plt.plot(results[m]["time"], results[m]["cosphi_ar"], label=m)
-    plt.title("Cos Phi Arrière")
+
+    # 3. COS PHI AVANT
+    plt.subplot(3, 2, 3)
+    for name, data in results.items():
+        ls, lw, alpha = styles.get(name, ('-', 1, 1))
+        plt.plot(data['time'], data['cos_phi_f'], label=name, 
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.title("Rendement Moteur AVANT")
+    plt.ylabel("Cos Phi")
     plt.ylim(0, 1.1)
     plt.grid(True)
-    plt.xlim(0, duration)
 
+    # 4. COS PHI ARRIERE
+    plt.subplot(3, 2, 4)
+    for name, data in results.items():
+        ls, lw, alpha = styles.get(name, ('-', 1, 1))
+        plt.plot(data['time'], data['cos_phi_r'], label=name, 
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.title("Rendement Moteur ARRIERE")
+    plt.ylabel("Cos Phi")
+    plt.ylim(0, 1.1)
+    plt.grid(True)
+
+    # 5. PUISSANCE ELEC TOTALE (Pour voir qui gagne)
+    plt.subplot(3, 2, (5, 6)) # Prend toute la largeur en bas
+    for name, data in results.items():
+        ls, lw, alpha = styles.get(name, ('-', 1, 1))
+        plt.plot(data['time'], data['power'], label=name, 
+                 linestyle=ls, linewidth=lw, alpha=alpha)
+    plt.title("Puissance Électrique Consommée (Totale)")
+    plt.xlabel("Temps (s)")
+    plt.ylabel("Watts")
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
