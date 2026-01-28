@@ -10,6 +10,7 @@ if pkg_dir not in sys.path: sys.path.append(pkg_dir)
 try:
     from src.data_loader import DataLoader
     from src.vehicle_sim.control.allocation import TorqueAllocator
+    from vehicle_sim.control.allocation import TorqueAllocator
 except ImportError:
     from src.vehicle_sim.utils.data_loader import DataLoader
     from src.vehicle_sim.control.allocation import TorqueAllocator
@@ -25,7 +26,7 @@ class Simulation:
         if not os.path.exists(map_path): map_path = os.path.join(data_dir, "efficiency_map.csv")
 
         self.loader = DataLoader(map_path)
-        self.allocator = TorqueAllocator(self.loader)
+        self.allocator = TorqueAllocator()
         self.strategies = ["Inverse", "Piecewise", "Smooth", "Quadratic"]
 
     def _val(self, obj, key, default):
@@ -60,7 +61,8 @@ class Simulation:
                 rpm = (v * 60) / (2 * np.pi * wheel_r)
                 
                 # Optimisation
-                res = self.allocator.optimize(strat, T_req, rpm, prev_front_ratio=prev_ratio)
+                res = self.allocator.optimize(strat, T_req, rpm)
+                prev_ratio = res["ratio_front"]
                 
                 Tf = res['T_front']
                 Tr = res['T_rear']
