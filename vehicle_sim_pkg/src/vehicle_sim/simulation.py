@@ -8,7 +8,7 @@ pkg_dir = os.path.dirname(os.path.dirname(current_dir))
 if pkg_dir not in sys.path: sys.path.append(pkg_dir)
 
 try:
-    from src.data_loader import DataLoader
+    from src.vehicle_sim.utils.data_loader import DataLoader
     from src.vehicle_sim.control.allocation import TorqueAllocator
 except ImportError:
     from src.vehicle_sim.utils.data_loader import DataLoader
